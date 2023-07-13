@@ -17,17 +17,18 @@ use_python("/opt/homebrew/bin/python3")
 ```
 
 ```{r message=FALSE, warning=FALSE}
-train <- read_csv("./house-prices-advanced-regression-techniques/train.csv")
-test <- read_csv("./house-prices-advanced-regression-techniques/test.csv")
+train <- read_csv("./Housing/house-prices-advanced-regression-techniques/train.csv")
+test <- read_csv("./Housing/house-prices-advanced-regression-techniques/test.csv")
 ```
 
 ```{r}
-train.char <- train %>%
+train_char <- train %>%
   select(where(is.character)) %>%
-  select(-Alley)
+  select(-Id)
 
 train_num <- train %>%
-  select(where(is.double))
+  select(where(is.double)) %>%
+  select(-Id)
 
 
 X_test_char <- test %>%
@@ -37,7 +38,7 @@ X_test_char <- test %>%
 X_test_num_standardized <- test %>%
   select(where(is.double)) %>%
   drop_na() %>%
-  select(-Id) %>%
+  select(-Alley) %>%
   apply(
     MARGIN = 2,
     FUN = function(x) {
@@ -47,7 +48,7 @@ X_test_num_standardized <- test %>%
 
 train_num.standardized <- train_num %>%
   drop_na() %>%
-  select(-Id) %>%
+  select(-Alley) %>%
   apply(
     MARGIN = 2,
     FUN = function(x) {
@@ -56,6 +57,7 @@ train_num.standardized <- train_num %>%
   )
 
 X_train_num <- train_num.standardized[, 1:36]
+X_train_whole = cbind(train_num, train_char)
 y_train <- train_num.standardized[, 37]
 y_sd <- sd(train_num$SalePrice)
 y_mean <- mean(train_num$SalePrice)
@@ -103,6 +105,7 @@ model1 <- glm(SalePrice ~ )
 Here we fit a Neural Network as the second model.
 
 ```{python}
+repl_python()
 import numpy as np
 from keras.models import Sequential
 from keras.layers import Dense
@@ -148,7 +151,7 @@ X_test = r.X_test_num_standardized
 
 xgb_model = XGBRegressor(n_estimators=1000)
 xgb_model.fit(X_train, y_train)
-xgb_preds = xgb_model.predict(X_test)
+xgb_preds = xgb_model.predict(test)
 xgb_Predictions = xgb_preds * r.y_sd + r.y_mean 
 
 cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1)
