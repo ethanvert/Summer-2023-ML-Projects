@@ -1,0 +1,167 @@
+---
+title: "Hosing Price Prediction"
+author: "Ethan Vertal"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gridExtra)
+library(reticulate)
+library(ggbiplot)
+library(np)
+
+use_python("/opt/homebrew/bin/python3")
+```
+
+```{r message=FALSE, warning=FALSE}
+train <- read_csv("./house-prices-advanced-regression-techniques/train.csv")
+test <- read_csv("./house-prices-advanced-regression-techniques/test.csv")
+```
+
+```{r}
+train.char <- train %>%
+  select(where(is.character)) %>%
+  select(-Alley)
+
+train_num <- train %>%
+  select(where(is.double))
+
+
+X_test_char <- test %>%
+  select(where(is.character)) %>%
+  drop_na()
+
+X_test_num_standardized <- test %>%
+  select(where(is.double)) %>%
+  drop_na() %>%
+  select(-Id) %>%
+  apply(
+    MARGIN = 2,
+    FUN = function(x) {
+      (x - mean(x)) / sd(x)
+    }
+  )
+
+train_num.standardized <- train_num %>%
+  drop_na() %>%
+  select(-Id) %>%
+  apply(
+    MARGIN = 2,
+    FUN = function(x) {
+      (x - mean(x)) / sd(x)
+    }
+  )
+
+X_train_num <- train_num.standardized[, 1:36]
+y_train <- train_num.standardized[, 37]
+y_sd <- sd(train_num$SalePrice)
+y_mean <- mean(train_num$SalePrice)
+
+```
+
+```{r}
+train.char.missing.prop <- train.char %>% 
+  is.na %>%
+  colSums
+
+train_num.missing.prop <- train_num %>% 
+  is.na %>%
+  colSums
+```
+
+```{r}
+# PCA
+
+pca <- prcomp(train_num.standardized)
+
+# Summary of the PCA
+# summary(pca)test
+
+# Extract the principal components
+principal_components <- pca$x
+
+# Proportion of variance explained by each principal component
+variance_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Correlations between variables and principal components
+loadings <- pca$rotation
+
+#Visualize the results
+ggbiplot(pca, alpha=0.25, varname.adjust = 2)
+
+```
+
+Our first model is a GLM in R selected using step-wise backward regression.
+
+```{r}
+model1 <- glm(SalePrice ~ )
+```
+
+Here we fit a Neural Network as the second model.
+
+```{python}
+import numpy as np
+from keras.models import Sequential
+from keras.layers import Dense
+
+
+# Get train data from R DataFrames and Convert to NumPy arrays
+X_train = r.X_train_num
+y_train = np.array(r.y_train)
+ 
+# Get test data from R
+X_test = r.X_test_num_standardized
+ 
+nn_model = Sequential()
+
+nn_model.add(Dense(units=128, input_dim=36, activation='relu'))
+nn_model.add(Dense(units=256, activation='relu'))
+nn_model.add(Dense(units=64, activation='tanh'))
+nn_model.add(Dense(units=1, kernel_initializer='normal'))
+
+nn_model.compile(loss='mean_squared_error', optimizer='adam')
+_ = nn_model.fit(X_train, y_train, batch_size = 64, epochs = 50, verbose=0)
+
+nn_preds = nn_model.predict(X_test, verbose=0)
+
+# undo standardization and scaling for our predictions
+nn_Predictions= nn_preds * r.y_sd + r.y_mean 
+```
+
+Here we fit an XGBoost tree regressor as our Third Model.
+
+```{python}
+import numpy as np
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import RepeatedKFold
+from xgboost import XGBRegressor
+
+# Get train data from R DataFrames and Convert to NumPy arrays
+X_train = r.X_train_num
+y_train = np.array(r.y_train)
+ 
+# Get test data from R
+X_test = r.X_test_num_standardized
+
+xgb_model = XGBRegressor(n_estimators=1000)
+xgb_model.fit(X_train, y_train)
+xgb_preds = xgb_model.predict(X_test)
+xgb_Predictions = xgb_preds * r.y_sd + r.y_mean 
+
+cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1)
+scores = cross_val_score(xgb_model, X_train, y_train, scoring='neg_mean_absolute_error', cv=cv, n_jobs=-1)
+
+scores = np.absolute(scores)
+print('Mean MAE: %.3f (%.3f)' % (scores.mean(), scores.std()) )
+```
+
+
+```{r}
+nn_results = data.frame(Prediction = py$nn_Predictions)
+xgb_results = data.frame(Prediction = py$xgb_Predictions)
+
+```
+
