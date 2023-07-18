@@ -12,72 +12,108 @@ library(gridExtra)
 library(reticulate)
 library(ggbiplot)
 library(np)
+library(zoo)
+library(fastDummies)
 
 use_python("/opt/homebrew/bin/python3")
 ```
 
 ```{r message=FALSE, warning=FALSE}
-train <- read_csv("./Housing/house-prices-advanced-regression-techniques/train.csv")
-test <- read_csv("./Housing/house-prices-advanced-regression-techniques/test.csv")
+train <- read_csv("./house-prices-advanced-regression-techniques/train.csv")
+test <- read_csv("./house-prices-advanced-regression-techniques/test.csv")
 ```
 
 ```{r}
+# Separate Character rows from train data
 train_char <- train %>%
-  select(where(is.character)) %>%
-  select(-Id)
+  select(where(is.character)) 
+  
 
+# Separate Numerical rows from train data
 train_num <- train %>%
   select(where(is.double)) %>%
-  select(-Id)
+  select(-Id) 
 
-
+# Separate Character rows from Test Data
 X_test_char <- test %>%
-  select(where(is.character)) %>%
-  drop_na()
+  select(where(is.character))
 
-X_test_num_standardized <- test %>%
-  select(where(is.double)) %>%
-  drop_na() %>%
-  select(-Alley) %>%
-  apply(
-    MARGIN = 2,
-    FUN = function(x) {
-      (x - mean(x)) / sd(x)
-    }
-  )
+X_test_num <- test %>%
+  select(where(is.double))
 
+# Dealing with Numerical missing training data. Imputing with mean for now.
+train_num <- na.aggregate(train_num, FUN = mean)
+
+# Dealing with Numerical missing test data. Imputing with mean for now.
+X_test_num <- na.aggregate(X_test_num, FUN = mean)
+
+# Standardized and Centered Numerical Rows; Train
 train_num.standardized <- train_num %>%
-  drop_na() %>%
-  select(-Alley) %>%
   apply(
     MARGIN = 2,
     FUN = function(x) {
       (x - mean(x)) / sd(x)
     }
-  )
+  )%>%
+  data.frame()
 
-X_train_num <- train_num.standardized[, 1:36]
-X_train_whole = cbind(train_num, train_char)
-y_train <- train_num.standardized[, 37]
-y_sd <- sd(train_num$SalePrice)
+# Standardized and Centered Numerical Rows; Test
+X_test_num_standardized <- X_test_num %>%
+  apply(
+    MARGIN = 2,
+    FUN = function(x) {
+      (x - mean(x)) / sd(x)
+    }
+  ) %>%
+  data.frame()
+
+
+# Dealing with NA's in Categorical data. Luckily they are just lacking the trait.
+# So I replaced them with string "None"
+train_char <- data.frame(lapply(train_char, function(x) ifelse(is.na(x), "None", x)))
+train_factor <- apply(train_char, 2, function(x) factor(x))
+train_factor_encoded <- dummy_cols(train_factor)
+X_train_num <- train_num.standardized %>%
+  select(-c(SalePrice))
+
+# Joined Num and Factor DataFrames
+X_train_whole_r = cbind(train_num.standardized, train_factor_encoded) %>%
+  select(!where(is.character))
+
+X_train_whole = cbind(X_train_num, train_factor_encoded) %>%
+  select(!where(is.character))
+
+y_train <- train_num.standardized["SalePrice"] 
+
+X_test_char <- data.frame(lapply(X_test_char, function(x) ifelse(is.na(x), "None", x)))
+X_test_factor <- apply(X_test_char, 2, function(x) factor(x))
+X_test_factor_encoded <- dummy_cols(X_test_factor)
+X_test_whole <- cbind(X_test_num_standardized, X_test_factor_encoded) %>%
+  select(!where(is.character))
+
+common_columns <- intersect(names(X_train_whole), names(X_test_whole))
+X_train_whole <- X_train_whole %>%
+  select(common_columns)
+
+common_columns_r <- intersect(names(X_train_whole_r), names(X_test_whole))
+X_train_whole_r <- X_train_whole_r %>%
+  select(common_columns_r) %>% 
+  cbind(data.frame(SalePrice = y_train))
+
+X_test_whole <- X_test_whole %>%
+  select(common_columns)
+
+# For un-standardizing predictions later
+y_sd <- sd(train_num$SalePrice) 
 y_mean <- mean(train_num$SalePrice)
 
 ```
 
-```{r}
-train.char.missing.prop <- train.char %>% 
-  is.na %>%
-  colSums
-
-train_num.missing.prop <- train_num %>% 
-  is.na %>%
-  colSums
-```
 
 ```{r}
 # PCA
 
-pca <- prcomp(train_num.standardized)
+pca <- prcomp(X_train_whole)
 
 # Summary of the PCA
 # summary(pca)test
@@ -99,36 +135,123 @@ ggbiplot(pca, alpha=0.25, varname.adjust = 2)
 Our first model is a GLM in R selected using step-wise backward regression.
 
 ```{r}
-model1 <- glm(SalePrice ~ )
+model1 <- glm(SalePrice ~ ., data=X_train_whole_r) %>%
+  step(., direction = "backward", trace=0)
 ```
+
+```{r}
+# summary(model1)
+```
+
+Now, we make the predictions on our test data using Model 1.
+
+```{r}
+glm_preds <- predict(model1, newdata=X_test_whole)
+glm_Predictions <-  glm_preds * y_sd + y_mean
+```
+
 
 Here we fit a Neural Network as the second model.
 
 ```{python}
-repl_python()
 import numpy as np
 from keras.models import Sequential
 from keras.layers import Dense
-
+from keras.layers import Dropout
+from keras.optimizers import Adam
+import keras_tuner as kt
+from keras.callbacks import EarlyStopping
 
 # Get train data from R DataFrames and Convert to NumPy arrays
-X_train = r.X_train_num
+X_train = r.X_train_whole
 y_train = np.array(r.y_train)
+
+print(X_train.shape)
  
 # Get test data from R
-X_test = r.X_test_num_standardized
+X_test = r.X_test_whole
+
+print(X_test.shape)
+
+def build_nn_model(hp):
+  nn_model = Sequential()
+
+  nn_model.add(
+      Dense(
+          # Tune number of units.
+          units=hp.Int("units", min_value=32, max_value=284**10, step=128),
+          input_dim=284,
+          # Tune the activation function to use.
+          activation=hp.Choice("activation", ["relu", "tanh"]),
+      )
+  )
+  nn_model.add(
+      Dense(
+          # Tune number of units.
+          units=hp.Int("units", min_value=32, max_value=284**5, step=64),
+          # Tune the activation function to use.
+          activation=hp.Choice("activation", ["relu", "tanh"]),
+      )
+  )
+  nn_model.add(
+      Dense(
+          # Tune number of units.
+          units=hp.Int("units", min_value=32, max_value=284**2, step=32),
+          # Tune the activation function to use.
+          activation=hp.Choice("activation", ["relu", "tanh"]),
+      )
+  )
+  nn_model.add(
+    Dense(
+      units = 284,
+      activation="tanh"
+    )
+  )
+  nn_model.add(
+    Dense(
+      units = 284//2,
+      activation="relu"
+    )
+  )
+  nn_model.add(
+    Dense(units=1)
+  )
+  
+  
+  
+  # Tune whether to use dropout.
+  if hp.Boolean("dropout"):
+      nn_model.add(Dropout(rate=0.25))
+  nn_model.add(Dense(units=1, kernel_initializer='normal'))
+  # Define the optimizer learning rate as a hyperparameter.
+  learning_rate = hp.Float("lr", min_value=1e-4, max_value=1e-2, sampling="log")
+  nn_model.compile(
+      optimizer=Adam(learning_rate=learning_rate),
+      loss="mean_squared_error",
+      metrics=["mean_squared_error"],
+  )
+  return nn_model
  
-nn_model = Sequential()
+# _ = nn_model.fit(X_train, y_train, batch_size = 64, epochs = 107, verbose=1)
 
-nn_model.add(Dense(units=128, input_dim=36, activation='relu'))
-nn_model.add(Dense(units=256, activation='relu'))
-nn_model.add(Dense(units=64, activation='tanh'))
-nn_model.add(Dense(units=1, kernel_initializer='normal'))
+# nn_preds = nn_model.predict(X_test, verbose=0)
 
-nn_model.compile(loss='mean_squared_error', optimizer='adam')
-_ = nn_model.fit(X_train, y_train, batch_size = 64, epochs = 50, verbose=0)
+tuner = kt.Hyperband(build_nn_model,
+                     objective='val_loss',
+                     max_epochs=10)
+                     
+stop_early = EarlyStopping(monitor='val_loss', patience=5)
+tuner.search(X_train, y_train, epochs=150, validation_split=0.2, callbacks=[stop_early])
+best_hps=tuner.get_best_hyperparameters(num_trials=1)[0]
 
-nn_preds = nn_model.predict(X_test, verbose=0)
+nn_model = tuner.hypermodel.build(best_hps)
+history = nn_model.fit(X_train, y_train, epochs=150, validation_split=0.2)
+
+val_acc_per_epoch = history.history['val_loss']
+best_epoch = val_acc_per_epoch.index(max(val_acc_per_epoch)) + 1
+
+nn_model_final = tuner.hypermodel.build(best_hps)
+nn_preds = nn_model_final.predict(X_test)
 
 # undo standardization and scaling for our predictions
 nn_Predictions= nn_preds * r.y_sd + r.y_mean 
@@ -136,26 +259,44 @@ nn_Predictions= nn_preds * r.y_sd + r.y_mean
 
 Here we fit an XGBoost tree regressor as our Third Model.
 
-```{python}
+```{python echo=FALSE}
 import numpy as np
 from sklearn.model_selection import cross_val_score
 from sklearn.model_selection import RepeatedKFold
+from sklearn.model_selection import GridSearchCV
 from xgboost import XGBRegressor
 
 # Get train data from R DataFrames and Convert to NumPy arrays
-X_train = r.X_train_num
-y_train = np.array(r.y_train)
+X_train = r.X_train_whole
+y_train = r.y_train
  
 # Get test data from R
-X_test = r.X_test_num_standardized
+X_test = r.X_test_whole
 
-xgb_model = XGBRegressor(n_estimators=1000)
-xgb_model.fit(X_train, y_train)
-xgb_preds = xgb_model.predict(test)
+xgb_model = XGBRegressor()
+parameters = {'nthread':[-1], #when use hyperthread, xgboost may become slower
+              'objective':['reg:linear'],
+              'learning_rate': [.03, 0.05, .07], #so called `eta` value
+              'max_depth': [7, 8, 9, 10],
+              'min_child_weight': [4],
+              'silent': [1],
+              'subsample': [0.7],
+              'colsample_bytree': [0.7],
+              'n_estimators': [500, 1000]}
+xgb_grid = GridSearchCV(xgb_model,
+                        parameters,
+                        cv = 2,
+                        n_jobs = 5,
+                        verbose=False)
+
+xgb_grid.fit(X_train, y_train, verbose=False)
+
+
+xgb_preds = xgb_grid.predict(X_test)
 xgb_Predictions = xgb_preds * r.y_sd + r.y_mean 
 
 cv = RepeatedKFold(n_splits=10, n_repeats=3, random_state=1)
-scores = cross_val_score(xgb_model, X_train, y_train, scoring='neg_mean_absolute_error', cv=cv, n_jobs=-1)
+scores = cross_val_score(xgb_grid, X_train, y_train, scoring='neg_mean_absolute_error', cv=cv, n_jobs=-1)
 
 scores = np.absolute(scores)
 print('Mean MAE: %.3f (%.3f)' % (scores.mean(), scores.std()) )
@@ -163,8 +304,14 @@ print('Mean MAE: %.3f (%.3f)' % (scores.mean(), scores.std()) )
 
 
 ```{r}
-nn_results = data.frame(Prediction = py$nn_Predictions)
-xgb_results = data.frame(Prediction = py$xgb_Predictions)
+#glm_results = data.frame(ID = test$Id, SalePrice = glm_Predictions)
+#nn_results = data.frame(ID = test$Id, SalePrice = py$nn_Predictions)
+xgb_results = data.frame(ID = test$Id, SalePrice = py$xgb_Predictions)
+```
 
+```{r}
+#write_csv(glm_results, "./submission.csv")
+#write_csv(nn_results, "./nn_submission.csv")
+write_csv(xgb_results, "./xgb_submission.csv")
 ```
 
